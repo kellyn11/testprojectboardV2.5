@@ -66,4 +66,10 @@
                           purchase easily.        view\
                                                   AC3: Search by status
                                                   shown
+
+  12                      As a user, I want to    AC1; Validation needed
+                          delete items from the   
+                          cart so that I can      
+                          remove unnecessary      
+                          items                   
   -----------------------------------------------------------------------
