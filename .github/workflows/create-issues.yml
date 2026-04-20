@@ -1,4 +1,4 @@
-name: Create Issues from Table Markdown
+name: Create Issues from Flattened Stories Markdown
 
 on:
   workflow_dispatch:
@@ -42,18 +42,30 @@ jobs:
 
           current_section="General"
           pending_sn=""
-          pending_story=""
-          pending_ac=""
+          pending_text=""
 
           flush_row() {
-            if [ -z "$pending_sn" ] || [ -z "$pending_story" ]; then
+            if [ -z "$pending_sn" ] || [ -z "$pending_text" ]; then
               return
             fi
+
+            text="$(echo "$pending_text" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')"
+
+            if [[ "$text" == *"AC1:"* ]]; then
+              story="${text%%AC1:*}"
+              ac="AC1:${text#*AC1:}"
+            else
+              story="$text"
+              ac=""
+            fi
+
+            story="$(echo "$story" | sed 's/^ *//;s/ *$//')"
+            ac="$(echo "$ac" | sed 's/^ *//;s/ *$//')"
 
             title="US${pending_sn}"
 
             body=$(printf "**Section:** %s\n\n**User Story**\n%s\n\n**Acceptance Criteria**\n%s\n" \
-              "$current_section" "$pending_story" "$pending_ac")
+              "$current_section" "$story" "$ac")
 
             existing=$(gh issue list \
               --repo "$REPO" \
@@ -73,8 +85,7 @@ jobs:
             fi
 
             pending_sn=""
-            pending_story=""
-            pending_ac=""
+            pending_text=""
           }
 
           while IFS= read -r line || [ -n "$line" ]; do
@@ -85,7 +96,12 @@ jobs:
               continue
             fi
 
-            # Section heading like 2.1 User Management
+            # Keep major heading out
+            if [[ "$trimmed" == "2. Functional Requirements" ]]; then
+              continue
+            fi
+
+            # Section heading like 2.1 User Management / 2.2 Shopping
             if [[ "$trimmed" =~ ^[0-9]+\.[0-9]+[[:space:]]+ ]]; then
               flush_row
               current_section="$trimmed"
@@ -93,53 +109,22 @@ jobs:
               continue
             fi
 
-            # Skip known headers
-            if [[ "$trimmed" == "SN" || "$trimmed" == "User Stories" || "$trimmed" == "Acceptance Criteria" ]]; then
+            # Skip headers
+            if [[ "$trimmed" == "SN" || "$trimmed" == "User Stories" || "$trimmed" == "Acceptance Criteria" || "$trimmed" == "SN User Stories Acceptance Criteria" ]]; then
               continue
             fi
 
-            # Pipe-table row like: | 1 | As a user... | AC1... |
-            if [[ "$trimmed" =~ ^\| ]]; then
-              # skip separator rows
-              if [[ "$trimmed" =~ ^\|[[:space:]:-]+\|[[:space:]:-]+\| ]]; then
-                continue
-              fi
-
-              row="$(echo "$trimmed" | sed 's/^|//;s/|$//')"
-              sn="$(echo "$row" | cut -d'|' -f1 | xargs)"
-              story="$(echo "$row" | cut -d'|' -f2 | xargs)"
-              ac="$(echo "$row" | cut -d'|' -f3- | sed 's/^ *//;s/ *$//')"
-
-              if [[ "$sn" =~ ^[0-9]+$ ]]; then
-                flush_row
-                pending_sn="$sn"
-                pending_story="$story"
-                pending_ac="$ac"
-                flush_row
-              fi
-              continue
-            fi
-
-            # Plain numeric row start like: 1
-            if [[ "$trimmed" =~ ^[0-9]+$ ]]; then
+            # Start of a new story row: number followed by text
+            if [[ "$trimmed" =~ ^([0-9]+)[[:space:]]+(.+)$ ]]; then
               flush_row
-              pending_sn="$trimmed"
+              pending_sn="${BASH_REMATCH[1]}"
+              pending_text="${BASH_REMATCH[2]}"
               continue
             fi
 
-            # First text after SN = story
-            if [ -n "$pending_sn" ] && [ -z "$pending_story" ]; then
-              pending_story="$trimmed"
-              continue
-            fi
-
-            # Remaining text after story = acceptance criteria
-            if [ -n "$pending_sn" ] && [ -n "$pending_story" ]; then
-              if [ -z "$pending_ac" ]; then
-                pending_ac="$trimmed"
-              else
-                pending_ac="$pending_ac"$'\n'"$trimmed"
-              fi
+            # Continuation line of current story row
+            if [ -n "$pending_sn" ]; then
+              pending_text="$pending_text $trimmed"
             fi
           done < "$FILE"
 
