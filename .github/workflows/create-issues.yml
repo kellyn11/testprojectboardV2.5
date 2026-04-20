@@ -1,4 +1,4 @@
-name: Create Issues from Flattened Stories Markdown
+name: Create Issues from DOCX Table
 
 on:
   workflow_dispatch:
@@ -15,17 +15,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install GitHub CLI
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gh
+          python -m pip install --upgrade pip
+          pip install python-docx
 
-      - name: Authenticate GitHub CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh auth status
-
-      - name: Create issues from stories.md
+      - name: Create issues from stories.docx
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -33,99 +33,133 @@ jobs:
         run: |
           set -euo pipefail
 
-          FILE="output/stories.md"
+          python - <<'PY'
+          import re
+          import subprocess
+          from docx import Document
 
-          if [ ! -f "$FILE" ]; then
-            echo "Missing $FILE"
-            exit 1
-          fi
+          REPO = "${{ github.repository }}"
+          DOCX_PATH = "input/stories.docx"
 
-          current_section="General"
-          pending_sn=""
-          pending_text=""
+          def gh(*args):
+              result = subprocess.run(
+                  ["gh", *args],
+                  check=True,
+                  capture_output=True,
+                  text=True
+              )
+              return result.stdout.strip()
 
-          flush_row() {
-            if [ -z "$pending_sn" ] || [ -z "$pending_text" ]; then
-              return
-            fi
+          def clean_text(text: str) -> str:
+              return re.sub(r"\s+", " ", (text or "").strip())
 
-            text="$(echo "$pending_text" | tr '\n' ' ' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')"
+          def make_title(sn: str, story: str) -> str:
+              text = clean_text(story)
 
-            if [[ "$text" == *"AC1:"* ]]; then
-              story="${text%%AC1:*}"
-              ac="AC1:${text#*AC1:}"
-            else
-              story="$text"
-              ac=""
-            fi
+              text = re.sub(r"^As an? .*?,\s*I want to\s*", "", text, flags=re.I)
+              text = re.sub(r"\s+so that.*$", "", text, flags=re.I)
+              text = text.strip().rstrip(".")
+              text = text[:80].strip()
 
-            story="$(echo "$story" | sed 's/^ *//;s/ *$//')"
-            ac="$(echo "$ac" | sed 's/^ *//;s/ *$//')"
+              if not text:
+                  text = f"Story {sn}"
 
-            title="US${pending_sn}"
+              return f"US{sn} - {text[:1].upper() + text[1:]}"
 
-            body=$(printf "**Section:** %s\n\n**User Story**\n%s\n\n**Acceptance Criteria**\n%s\n" \
-              "$current_section" "$story" "$ac")
+          def issue_exists(sn: str) -> bool:
+              result = subprocess.run(
+                  [
+                      "gh", "issue", "list",
+                      "--repo", REPO,
+                      "--state", "all",
+                      "--search", f"\"US{sn} -\" in:title",
+                      "--json", "title",
+                      "--jq", f'.[] | select(.title | startswith("US{sn} -")) | .title'
+                  ],
+                  capture_output=True,
+                  text=True
+              )
+              return bool(result.stdout.strip())
 
-            existing=$(gh issue list \
-              --repo "$REPO" \
-              --state all \
-              --search "\"$title\" in:title" \
-              --json title \
-              --jq ".[] | select(.title == \"$title\") | .title" || true)
+          doc = Document(DOCX_PATH)
 
-            if [ -n "$existing" ]; then
-              echo "Skipping existing issue: $title"
-            else
-              echo "Creating issue: $title"
-              gh issue create \
-                --repo "$REPO" \
-                --title "$title" \
-                --body "$body"
-            fi
+          current_section = "General"
+          seen = 0
 
-            pending_sn=""
-            pending_text=""
-          }
+          for table in doc.tables:
+              rows = table.rows
+              if not rows:
+                  continue
 
-          while IFS= read -r line || [ -n "$line" ]; do
-            line="${line%$'\r'}"
-            trimmed="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              header = [clean_text(c.text) for c in rows[0].cells[:3]]
+              if len(header) < 3:
+                  continue
 
-            if [ -z "$trimmed" ]; then
-              continue
-            fi
+              if header[0] != "SN" or header[1] != "User Stories" or header[2] != "Acceptance Criteria":
+                  continue
 
-            # Keep major heading out
-            if [[ "$trimmed" == "2. Functional Requirements" ]]; then
-              continue
-            fi
+              # find nearest heading before this table
+              # fallback uses last non-empty paragraph matching x.y heading
+              for p in doc.paragraphs:
+                  txt = clean_text(p.text)
+                  if re.match(r"^\d+\.\d+\s+", txt):
+                      current_section = txt
 
-            # Section heading like 2.1 User Management / 2.2 Shopping
-            if [[ "$trimmed" =~ ^[0-9]+\.[0-9]+[[:space:]]+ ]]; then
-              flush_row
-              current_section="$trimmed"
-              echo "Section: $current_section"
-              continue
-            fi
+              for row in rows[1:]:
+                  cells = row.cells
+                  if len(cells) < 3:
+                      continue
 
-            # Skip headers
-            if [[ "$trimmed" == "SN" || "$trimmed" == "User Stories" || "$trimmed" == "Acceptance Criteria" || "$trimmed" == "SN User Stories Acceptance Criteria" ]]; then
-              continue
-            fi
+                  sn = clean_text(cells[0].text)
+                  story = clean_text(cells[1].text)
+                  ac_raw = cells[2].text.strip()
 
-            # Start of a new story row: number followed by text
-            if [[ "$trimmed" =~ ^([0-9]+)[[:space:]]+(.+)$ ]]; then
-              flush_row
-              pending_sn="${BASH_REMATCH[1]}"
-              pending_text="${BASH_REMATCH[2]}"
-              continue
-            fi
+                  if not re.fullmatch(r"\d+", sn):
+                      continue
+                  if not story:
+                      continue
 
-            # Continuation line of current story row
-            if [ -n "$pending_sn" ]; then
-              pending_text="$pending_text $trimmed"
-            fi
-          done < "$FILE"
+                  title = make_title(sn, story)
 
-          flush_row
+                  ac_lines = []
+                  for line in ac_raw.splitlines():
+                      line = line.strip()
+                      if line:
+                          ac_lines.append(line)
+
+                  body_parts = [
+                      f"**Section:** {current_section}",
+                      "",
+                      "**User Story**",
+                      story,
+                      "",
+                      "**Acceptance Criteria**",
+                  ]
+
+                  if ac_lines:
+                      body_parts.extend(ac_lines)
+                  elif ac_raw.strip():
+                      body_parts.append(ac_raw.strip())
+                  else:
+                      body_parts.append("No acceptance criteria provided.")
+
+                  body = "\n".join(body_parts)
+
+                  if issue_exists(sn):
+                      print(f"Skipping existing issue: US{sn}")
+                      continue
+
+                  print(f"Creating issue: {title}")
+                  subprocess.run(
+                      [
+                          "gh", "issue", "create",
+                          "--repo", REPO,
+                          "--title", title,
+                          "--body", body
+                      ],
+                      check=True
+                  )
+                  seen += 1
+
+          print(f"Done. Created {seen} issue(s).")
+          PY
