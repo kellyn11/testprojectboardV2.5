@@ -1,0 +1,123 @@
+name: Create Issues from Table Markdown
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-issues:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Authenticate GitHub CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh auth status
+
+      - name: Create issues from stories.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="output/stories.md"
+
+          if [ ! -f "$FILE" ]; then
+            echo "Missing $FILE"
+            exit 1
+          fi
+
+          current_section="General"
+          pending_sn=""
+          pending_story=""
+          pending_ac=""
+
+          flush_row() {
+            if [ -z "$pending_sn" ] || [ -z "$pending_story" ]; then
+              return
+            fi
+
+            short_title="US${pending_sn}"
+            body=$(printf "**Section:** %s\n\n**User Story**\n%s\n\n**Acceptance Criteria**\n%s\n" \
+              "$current_section" "$pending_story" "$pending_ac")
+
+            existing=$(gh issue list \
+              --repo "$REPO" \
+              --state all \
+              --search "\"$short_title\" in:title" \
+              --json title \
+              --jq ".[] | select(.title == \"$short_title\") | .title" || true)
+
+            if [ -n "$existing" ]; then
+              echo "Skipping existing issue: $short_title"
+            else
+              echo "Creating issue: $short_title"
+              gh issue create \
+                --repo "$REPO" \
+                --title "$short_title" \
+                --body "$body"
+            fi
+
+            pending_sn=""
+            pending_story=""
+            pending_ac=""
+          }
+
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            trimmed="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+            if [ -z "$trimmed" ]; then
+              continue
+            fi
+
+            # Section heading like: 2.1 User Management
+            if [[ "$trimmed" =~ ^[0-9]+\.[0-9]+[[:space:]]+ ]]; then
+              flush_row
+              current_section="$trimmed"
+              echo "Section: $current_section"
+              continue
+            fi
+
+            # Skip table headers
+            if [[ "$trimmed" == "SN" || "$trimmed" == "User Stories" || "$trimmed" == "Acceptance Criteria" ]]; then
+              continue
+            fi
+
+            # Story number row
+            if [[ "$trimmed" =~ ^[0-9]+$ ]]; then
+              flush_row
+              pending_sn="$trimmed"
+              continue
+            fi
+
+            # First text after SN = story
+            if [ -n "$pending_sn" ] && [ -z "$pending_story" ]; then
+              pending_story="$trimmed"
+              continue
+            fi
+
+            # Remaining lines = acceptance criteria
+            if [ -n "$pending_sn" ] && [ -n "$pending_story" ]; then
+              if [ -z "$pending_ac" ]; then
+                pending_ac="$trimmed"
+              else
+                pending_ac="$pending_ac"$'\n'"$trimmed"
+              fi
+            fi
+          done < "$FILE"
+
+          flush_row
